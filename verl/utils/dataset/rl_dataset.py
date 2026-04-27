@@ -37,7 +37,15 @@ from verl.utils.tokenizer import normalize_token_ids
 logger = logging.getLogger(__name__)
 
 
-def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
+_LEAN4_INSTRUCTION = (
+    "First provide a detailed proof plan outlining the main proof steps and strategies.\n"
+    "The plan should highlight key ideas, intermediate lemmas, and proof structures "
+    "that will guide the construction of the final formal proof.\n"
+    "Then provide the completed Lean 4 file in a ```lean4``` code block."
+)
+
+
+def build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
     """Build the user message for a Lean 4 proof-completion task.
 
     The prompt asks the model to first sketch a proof plan and then emit a
@@ -48,10 +56,7 @@ def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
     user_prompt = (
         "Complete the following Lean 4 code:\n\n"
         f"```lean4\n{formalization}```\n\n"
-        "First provide a detailed proof plan outlining the main proof steps and strategies.\n"
-        "The plan should highlight key ideas, intermediate lemmas, and proof structures "
-        "that will guide the construction of the final formal proof.\n"
-        "Then provide the completed Lean 4 file in a ```lean4``` code block."
+        f"{_LEAN4_INSTRUCTION}"
     )
     return [{"role": "user", "content": user_prompt}]
 
@@ -215,7 +220,7 @@ class RLHFDataset(Dataset):
             return example
 
         normalized = dict(example)
-        normalized["prompt"] = _build_formal_math_prompt(formalization)
+        normalized["prompt"] = build_formal_math_prompt(formalization)
         normalized.setdefault("data_source", "formal_math")
         normalized.setdefault("reward_model", {"ground_truth": "", "style": "formal_math"})
 
