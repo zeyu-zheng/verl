@@ -36,6 +36,25 @@ from verl.utils.import_utils import load_extern_object
 logger = logging.getLogger(__name__)
 
 
+def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
+    """Build the user message for a Lean 4 proof-completion task.
+
+    The prompt asks the model to first sketch a proof plan and then emit a
+    fenced ``lean4`` block, so that ``compute_score`` can extract the proof
+    body and forward it to ``lake exe repl`` regardless of whether the model
+    is a dedicated prover or a general chat model.
+    """
+    user_prompt = (
+        "Complete the following Lean 4 code:\n\n"
+        f"```lean4\n{formalization}```\n\n"
+        "First provide a detailed proof plan outlining the main proof steps and strategies.\n"
+        "The plan should highlight key ideas, intermediate lemmas, and proof structures "
+        "that will guide the construction of the final formal proof.\n"
+        "Then provide the completed Lean 4 file in a ```lean4``` code block."
+    )
+    return [{"role": "user", "content": user_prompt}]
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -178,6 +197,33 @@ class RLHFDataset(Dataset):
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
+    def _normalize_formal_math_example(self, example: dict) -> dict:
+        """Synthesise a chat ``prompt`` for raw formal-math rows.
+
+        The formal-math dataset stores rows with only a raw ``formalization``
+        column (the Lean 4 statement ending in ``:= by sorry``) and no
+        chat-formatted ``prompt``. verl expects every example to already
+        carry a ``prompt`` plus a ``data_source`` / ``reward_model`` triplet,
+        so we build them on the fly. Rows that already carry a ``prompt``
+        (or no ``formalization`` at all) are returned untouched.
+        """
+        if example.get("prompt") is not None:
+            return example
+        formalization = example.get("formalization")
+        if not formalization:
+            return example
+
+        normalized = dict(example)
+        normalized["prompt"] = _build_formal_math_prompt(formalization)
+        normalized.setdefault("data_source", "formal_math")
+        normalized.setdefault("reward_model", {"ground_truth": "", "style": "formal_math"})
+
+        extra_info = dict(normalized.get("extra_info") or {})
+        extra_info.setdefault("formal_statement", formalization)
+        extra_info.setdefault("timeout", 300)
+        normalized["extra_info"] = extra_info
+        return normalized
+
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
         if self.filter_overlong_prompts:
@@ -192,6 +238,7 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        doc = self._normalize_formal_math_example(doc)
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
@@ -239,6 +286,7 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        doc = self._normalize_formal_math_example(doc)
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
@@ -336,6 +384,7 @@ class RLHFDataset(Dataset):
     def __getitem__(self, item):
         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
         row_dict: dict = self.dataframe[item]
+        row_dict = self._normalize_formal_math_example(row_dict)
         row_dict["raw_prompt"] = self._build_messages(row_dict)
 
         # TODO(wuxibin): We still need a dummy tensor to make sure DataProto.batch is not empty.
