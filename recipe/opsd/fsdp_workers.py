@@ -24,7 +24,6 @@ import os
 
 import psutil
 import torch
-import torch.distributed
 from codetiming import Timer
 
 from verl import DataProto
@@ -108,14 +107,14 @@ class OPSDActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 metrics = self.actor.update_policy_opsd(data=data)
             delta_time = timer.last
 
-            global_num_tokens = data.meta_info.get("global_token_num", None)
-            if global_num_tokens is not None:
-                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-                # OPSD does 2 forwards per step (student + teacher) and 1 backward.
-                # PPO MFU formula assumes 1 forward per ppo_epoch; we approximate
-                # the 2-forward overhead as a 1.5x multiplier on actor MFU.
-                mfu_scale = 1.5 * self.config.actor.ppo_epochs
-                metrics["perf/mfu/actor"] = estimated_flops * mfu_scale / promised_flops / self.world_size
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # OPSD adds a teacher forward (no grad, ~2 * params * tokens) on top
+            # of the student fwd+bwd (~6 * params * tokens), so the per-epoch
+            # work is 4/3 of PPO's; scale ppo_epochs accordingly.
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * (4.0 / 3.0) * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)

@@ -13,27 +13,24 @@
 # limitations under the License.
 """On-Policy Self-Distillation Ray trainer.
 
-Inherits all the heavy lifting (dataloader, validation, checkpointing, balance,
-worker init) from ``RayPPOTrainer`` and only overrides ``fit`` to swap PPO's
-advantage / critic / KL machinery for a single OPSD step:
+Inherits dataloader, validation, checkpointing and worker init from
+``RayPPOTrainer``; overrides ``fit`` to replace PPO's advantage / critic /
+KL machinery with a single OPSD step:
 
 1. Generate student rollouts (vLLM via the colocated rollout engine).
-2. Build teacher inputs:
-    * Phase 1-2: clone the student tensors so JSD == 0 and we exercise the
-      full pipeline.
-    * Phase 3+: tokenize ``teacher_raw_prompt`` (NL proof sketch + Lean 4
-      statement) per-example and concat with the generated response.
+2. Build teacher inputs by tokenizing ``teacher_raw_prompt`` (NL proof
+   sketch + Lean 4 statement) and concatenating with the generated
+   response. Rows with no NL solution fall back to a clone of the student
+   inputs (degenerate teacher, JSD == 0).
 3. Call ``actor_rollout_wg.update_actor_opsd``: the worker computes student
    and teacher logits locally and backprops the JSD.
 
 The reward function is still wired through (the formal-math `lake exe repl`
 verifier) so we can score validation rollouts during long runs even though
-the training loss is purely distillation.
+the training loss itself is purely distillation.
 """
 
-import os
 import uuid
-from copy import deepcopy
 from pprint import pprint
 from typing import Optional
 
@@ -45,8 +42,9 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask
-from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import marked_timer
 from verl.utils.tracking import Tracking
 
 
@@ -60,9 +58,9 @@ def _build_teacher_tensors(
     """Tokenize ``teacher_raw_prompt`` (chat messages list) and concat with the
     student-generated response to form teacher input tensors.
 
-    For Phase 1-2 (no NL solutions yet) the dataset emits no
-    ``teacher_raw_prompt`` and we fall back to the student inputs, yielding a
-    JSD of zero and exercising the full pipeline end-to-end.
+    Rows that carry no ``teacher_raw_prompt`` (e.g. dataset slices without an
+    NL proof sketch) fall back to the student inputs, yielding a JSD of zero
+    and still exercising the full pipeline.
 
     Args:
         batch: full DataProto post-rollout. Must contain ``input_ids``,
@@ -92,7 +90,7 @@ def _build_teacher_tensors(
     )
 
     if not has_teacher_prompt:
-        # Phase 1-2 fallback: teacher == student. JSD is identically zero.
+        # Degenerate fallback: teacher == student. JSD is identically zero.
         return {
             "teacher_input_ids": student_input_ids.clone(),
             "teacher_attention_mask": batch.batch["attention_mask"].clone(),
@@ -141,8 +139,6 @@ def _build_teacher_tensors(
     teacher_attention_mask = torch.cat([prompt_attn, student_response_mask], dim=1)
     # Position ids: cumsum-style ids that are 0 on padding and 0..L-1 over the
     # unpadded prefix, matching verl's compute_position_id_with_mask helper.
-    from verl.utils.model import compute_position_id_with_mask
-
     teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
     teacher_response_offset = torch.tensor(
@@ -166,16 +162,14 @@ class RayOPSDTrainer(RayPPOTrainer):
     is replaced with an OPSD-specific ``fit``. The reward function is kept
     around solely for validation (formal-math `lake exe repl` verifier);
     training updates are driven by the JSD loss inside the actor worker.
-    """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # OPSD never updates a critic and never applies a KL-in-reward bonus.
-        # We keep `use_reference_policy=True` because the colocated teacher is
-        # exposed to the trainer as the "ref" path of the actor_rollout_ref
-        # worker, but the teacher forward is consumed inside update_actor_opsd
-        # rather than via compute_ref_log_prob.
-        self.use_critic = False
+    The colocated teacher is exposed via ``Role.ActorRolloutRef`` (so
+    ``use_reference_policy=True``) but its forward is consumed inside
+    ``update_actor_opsd`` rather than ``compute_ref_log_prob``. The critic
+    is disabled at the YAML level (``critic.enable: False`` in
+    ``formal_opsd.yaml``) so ``need_critic`` returns False without touching
+    ``algorithm.adv_estimator``.
+    """
 
     def fit(self):  # type: ignore[override]
         """OPSD training loop.
@@ -186,8 +180,9 @@ class RayOPSDTrainer(RayPPOTrainer):
              async rollout manager (vLLM).
           3. Union rollouts back into the batch and compute response_mask /
              global_token_num for FLOPs accounting.
-          4. Build teacher inputs (student-clone in Phase 1-2; tokenized
-             ``teacher_raw_prompt`` + response in Phase 3+).
+          4. Build teacher inputs (tokenized ``teacher_raw_prompt`` +
+             response, or a student-clone fallback when no NL sketch is
+             available).
           5. Call ``update_actor_opsd`` to compute JSD and step the optimizer.
           6. Optionally run validation and checkpoint.
         """
@@ -289,16 +284,21 @@ class RayOPSDTrainer(RayPPOTrainer):
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
+                    # Optional rollout dump. ``_log_rollout_data`` requires
+                    # ``token_level_scores``; we run the rule-based formal-math
+                    # verifier here purely for the dump (training itself does
+                    # not consume the reward).
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        # _log_rollout_data needs token_level_scores; OPSD doesn't
-                        # compute a reward during training, so synthesize a zero
-                        # tensor matching the response shape.
-                        if "token_level_scores" not in batch.batch:
-                            batch.batch["token_level_scores"] = torch.zeros_like(
-                                batch.batch["response_mask"], dtype=torch.float32
-                            )
-                        self._log_rollout_data(batch, {}, timing_raw, rollout_data_dir)
+                    if rollout_data_dir and self.reward_fn is not None:
+                        with marked_timer("reward_for_dump", timing_raw, color="yellow"):
+                            reward_out = self.reward_fn(batch, return_dict=True)
+                            if isinstance(reward_out, dict):
+                                batch.batch["token_level_scores"] = reward_out["reward_tensor"]
+                                reward_extra_infos = reward_out.get("reward_extra_info", {}) or {}
+                            else:
+                                batch.batch["token_level_scores"] = reward_out
+                                reward_extra_infos = {}
+                        self._log_rollout_data(batch, reward_extra_infos, timing_raw, rollout_data_dir)
 
                 # Validation
                 if (

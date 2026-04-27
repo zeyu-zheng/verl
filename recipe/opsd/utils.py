@@ -92,6 +92,21 @@ def validate_opsd_config(config: DictConfig, use_reference_policy: bool) -> None
                 "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
             )
 
+    # OPSD-specific: ``OPSDDataParallelPPOActor._forward_logits`` always runs
+    # a padded forward and slices ``logits[:, -response_length-1:-1, :]``. The
+    # remove-padding fast path in the parent ``DataParallelPPOActor`` would
+    # require unpacking and repadding full-vocab logits per micro-batch, which
+    # is not implemented and would explode peak memory on Qwen3.5's 248K
+    # vocab. Reject it up-front so misconfiguration cannot silently produce
+    # wrong logits.
+    if config.actor_rollout_ref.model.get("use_remove_padding", False):
+        raise ValueError(
+            "OPSD does not support actor_rollout_ref.model.use_remove_padding=True; "
+            "the JSD forward materialises full-vocab logits and only supports "
+            "padded inputs. Set use_remove_padding=False (also disables "
+            "ulysses_sequence_parallel_size>1)."
+        )
+
     if config.data.get("val_batch_size", None) is not None:
         print(
             "WARNING: val_batch_size is deprecated. Validation datasets are sent to inference engines "

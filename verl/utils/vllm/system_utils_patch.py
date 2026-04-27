@@ -40,17 +40,11 @@ _FIND_LOADED_LIBRARY_CALLERS = (
 def apply_find_loaded_library_patch() -> None:
     """Wrap ``vllm.utils.system_utils.find_loaded_library`` to skip stubs.
 
-    Best-effort: silently no-ops when vLLM is not installed or already
-    patched. Must run before any caller binds ``find_loaded_library`` from
-    ``vllm.utils.system_utils``.
-
-    OPSD specific: the recipe co-locates the student and the (frozen) teacher
-    on the same Ray actor. Loading the teacher's Qwen3.5 model triggers
-    ``fla`` -> ``tilelang`` between the actor's vLLM rollout init and the
-    rollout's first ``CudaRTLibrary()`` call, so the stub winds up in
-    ``/proc/self/maps`` even though we patched ``system_utils.find_loaded_library``
-    earlier. We additionally rebind the attribute in any caller module that
-    snapshotted the function at its own import time.
+    Best-effort: silently no-ops when vLLM is not installed. Idempotent: if
+    the source module is already patched we still re-walk caller modules
+    below in case any of them was imported after the first patch invocation
+    (e.g. when the teacher rollout pulls in ``fla -> tilelang`` between
+    ``CudaRTLibrary()`` calls in a colocated worker setup).
     """
     import sys
 
@@ -60,10 +54,7 @@ def apply_find_loaded_library_patch() -> None:
         return
 
     if getattr(system_utils, _PATCH_MARKER, False):
-        # Even when the marker is set we still rebind in caller modules below;
-        # they may have been imported after the first patch invocation.
-        patched_fn = system_utils.find_loaded_library
-        _rebind_in_callers(sys, patched_fn)
+        _rebind_in_callers(sys, system_utils.find_loaded_library)
         return
 
     original_find_loaded_library = system_utils.find_loaded_library
@@ -109,4 +100,4 @@ def _rebind_in_callers(sys_module, patched_fn) -> None:
             continue
         if getattr(mod, "find_loaded_library", None) is patched_fn:
             continue
-        setattr(mod, "find_loaded_library", patched_fn)
+        mod.find_loaded_library = patched_fn

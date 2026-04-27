@@ -135,27 +135,26 @@ class OPSDDataParallelPPOActor(DataParallelPPOActor):
 
         And in ``meta_info``:
 
-        * ``temperature``: rollout temperature (passed through to the JSD loss).
-        * ``opsd``: OmegaConf node carrying ``beta``, ``temperature``,
-          ``token_clip``, ``top_k``, and ``loss_temperature``.
+        * ``opsd``: dict carrying the JSD hyperparameters (``beta``,
+          ``temperature``, ``forward_temperature``, ``token_clip``, ``top_k``)
+          dehydrated from ``algorithm.opsd`` by the trainer.
         """
         self.actor_module.train()
         self.teacher_module.eval()
         for p in self.teacher_module.parameters():
             p.requires_grad_(False)
 
+        # ``forward_temperature`` is applied to the raw forward-pass logits;
+        # ``temperature`` is applied inside generalized_jsd_loss. The TRL reference
+        # only divides inside the loss (forward_temperature == 1.0).
         opsd_cfg = data.meta_info["opsd"]
-        # ``loss_temperature`` (default 1.0) is applied inside generalized_jsd_loss.
-        # ``forward_temperature`` (default 1.0) is applied to the raw forward-pass
-        # logits before the JSD softmax; the TRL reference calls
-        # logits / temperature with temperature=1.0 in the data_collator path.
-        forward_temperature = float(opsd_cfg.get("forward_temperature", 1.0))
-        loss_temperature = float(opsd_cfg.get("temperature", 1.0))
-        beta = float(opsd_cfg.get("beta", 0.0))
-        token_clip = opsd_cfg.get("token_clip", None)
+        forward_temperature = float(opsd_cfg["forward_temperature"])
+        loss_temperature = float(opsd_cfg["temperature"])
+        beta = float(opsd_cfg["beta"])
+        token_clip = opsd_cfg["token_clip"]
         token_clip = float(token_clip) if token_clip is not None else None
-        top_k = opsd_cfg.get("top_k", None)
-        top_k = int(top_k) if top_k is not None and int(top_k) > 0 else None
+        top_k = opsd_cfg["top_k"]
+        top_k = int(top_k) if top_k else None
 
         select_keys = [
             "responses",
@@ -170,59 +169,40 @@ class OPSDDataParallelPPOActor(DataParallelPPOActor):
         ]
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=[])
 
-        # OPSD-specific: under dynamic batching we must pack micro-batches by
-        # ``max(student_len, teacher_len)`` per example. The teacher input
-        # carries an extra natural-language proof sketch that is typically
-        # 5-10x longer than the student prompt, so packing on the student's
-        # ``attention_mask`` alone would dramatically under-estimate the
-        # per-example fwd cost (the teacher logits tensor dominates GPU
-        # memory in OPSD because we materialise the full-vocab logits for
-        # both forwards). We stash the real student attention mask so the
-        # student forward can address its actual sequence even after
-        # ``prepare_dynamic_batch`` overwrites ``attention_mask`` with a
-        # synthetic combined-length packing mask.
+        # Stash the real student attention mask before dynamic batching
+        # overwrites ``attention_mask`` with the synthetic packing mask
+        # (see the loop body below).
         data.batch["student_attention_mask"] = data.batch["attention_mask"].clone()
 
-        # Single mini-batch over the whole training batch (matches verl PPO when
-        # ppo_mini_batch_size == train_batch_size after rollout.n expansion).
-        # We respect ppo_mini_batch_size if set, but default to "all in one".
-        ppo_mini_batch_size = self.config.get("ppo_mini_batch_size", None)
-        if ppo_mini_batch_size is not None and ppo_mini_batch_size > 0:
-            mini_batches = data.split(ppo_mini_batch_size)
-        else:
-            mini_batches = [data]
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         metrics: dict[str, list[float]] = defaultdict(list)
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
-                use_dynamic_bsz = self.config.use_dynamic_bsz
-                if use_dynamic_bsz:
-                    # Build a synthetic attention_mask whose per-row sum is
-                    # ``max(student_len, teacher_len)``. ``rearrange_micro_batches``
-                    # only consults ``attention_mask.sum(dim=-1)`` to compute the
-                    # workload per example, so a sparse (n trailing zeros, n
-                    # leading ones) row is enough to encode the combined cost
-                    # we want it to balance against ``ppo_max_token_len_per_gpu``.
-                    student_lens = mini_batch.batch["student_attention_mask"].sum(dim=-1)
-                    teacher_lens = mini_batch.batch["teacher_attention_mask"].sum(dim=-1)
-                    pack_lens = torch.maximum(student_lens, teacher_lens)
-                    max_pack_len = int(pack_lens.max().item())
-                    bsz_curr = mini_batch.batch["student_attention_mask"].size(0)
-                    pack_mask = torch.zeros(
-                        (bsz_curr, max_pack_len),
-                        dtype=mini_batch.batch["student_attention_mask"].dtype,
-                        device=mini_batch.batch["student_attention_mask"].device,
+                if self.config.use_dynamic_bsz:
+                    # ``rearrange_micro_batches`` packs by ``attention_mask.sum(-1)``,
+                    # so we feed it a synthetic mask whose per-row length is
+                    # ``max(student_len, teacher_len)``. The teacher's NL prefix
+                    # is typically 5-10x longer than the student's prompt, so
+                    # packing on the student mask alone would under-estimate
+                    # peak memory (full-vocab logits are materialised for both
+                    # forwards). The real student mask is preserved as
+                    # ``student_attention_mask`` for the actual forward.
+                    pack_lens = torch.maximum(
+                        mini_batch.batch["student_attention_mask"].sum(dim=-1),
+                        mini_batch.batch["teacher_attention_mask"].sum(dim=-1),
                     )
-                    for i, n in enumerate(pack_lens.tolist()):
-                        pack_mask[i, :n] = 1
+                    max_pack_len = int(pack_lens.max().item())
+                    pack_mask = (
+                        torch.arange(max_pack_len, device=pack_lens.device).unsqueeze(0) < pack_lens.unsqueeze(-1)
+                    ).to(mini_batch.batch["student_attention_mask"].dtype)
                     mini_batch.batch["attention_mask"] = pack_mask
 
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = mini_batch.split(micro_batch_size)
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 # Total response token count across the entire mini-batch. We
                 # weight each micro-batch loss by (n_tokens_micro / n_tokens_mini)
