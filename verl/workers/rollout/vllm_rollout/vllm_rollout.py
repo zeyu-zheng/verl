@@ -51,6 +51,12 @@ except ModuleNotFoundError:
     # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
+try:
+    from vllm.v1.serial_utils import run_method as _vllm_run_method
+except ImportError:
+    # vllm < 0.11 kept WorkerWrapperBase.execute_method, no run_method helper.
+    _vllm_run_method = None
+
 from packaging import version as vs
 
 from verl import DataProto
@@ -202,7 +208,12 @@ class vLLMAsyncRollout(BaseRollout):
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        # vllm >= 0.11 removed the `vllm_config` kwarg from
+        # WorkerWrapperBase.__init__; older releases still require it.
+        if is_version_ge(pkg="vllm", minver="0.11.0"):
+            self.inference_engine = WorkerWrapperBase()
+        else:
+            self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
@@ -214,8 +225,11 @@ class vLLMAsyncRollout(BaseRollout):
             return self._init_worker(*args, **kwargs)
         elif method == "load_model":
             return self._load_model(*args, **kwargs)
-        else:
+        # vllm < 0.11 kept WorkerWrapperBase.execute_method; >= 0.11 replaced
+        # it with the standalone vllm.v1.serial_utils.run_method helper.
+        if hasattr(self.inference_engine, "execute_method"):
             return self.inference_engine.execute_method(method, *args, **kwargs)
+        return _vllm_run_method(self.inference_engine, method, args, kwargs)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

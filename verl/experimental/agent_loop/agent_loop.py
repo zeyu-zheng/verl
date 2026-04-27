@@ -669,13 +669,27 @@ class AgentLoopWorkerBase:
 
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+        # Pure-text rollouts on a VLM (no grids to align): skip mrope entirely.
+        if image_grid_thw is None and video_grid_thw is None:
+            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+
+        multi_modal_kwargs = {
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+        }
+        # transformers>=5.3.0: mm_token_type_ids is consumed only by position-id
+        # computation, so build it from the prompt tokens here.
+        if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
+            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
+            multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         # Model's get_rope_index has been dynamically bind to the processor.
         vision_position_ids, _ = self.processor.get_rope_index(
             input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
+            **multi_modal_kwargs,
         )
         vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
 

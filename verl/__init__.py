@@ -18,6 +18,12 @@ import os
 
 from packaging.version import parse as parse_version
 
+# Must run before vLLM is imported anywhere downstream so the patched
+# `find_loaded_library` is the one any caller binds.
+from .utils.vllm.system_utils_patch import apply_find_loaded_library_patch
+
+apply_find_loaded_library_patch()
+
 from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs
