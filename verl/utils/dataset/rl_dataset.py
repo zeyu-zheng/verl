@@ -44,7 +44,7 @@ _LEAN4_INSTRUCTION = (
 )
 
 
-def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
+def build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
     """Build the user message for a Lean 4 proof-completion task.
 
     The prompt asks the model to first sketch a proof plan and then emit a
@@ -66,7 +66,7 @@ def _build_formal_math_teacher_prompt(formalization: str, solution: str) -> list
     The teacher receives a privileged natural-language proof sketch prepended
     to the same Lean 4 statement the student sees, between
     ``=== Reference Reasoning Begin/End ===`` markers. The instruction tail is
-    byte-identical to ``_build_formal_math_prompt`` so the teacher's
+    byte-identical to ``build_formal_math_prompt`` so the teacher's
     completion-side tokens are tokenized under the same template suffix as the
     student's — this is what makes the JSD on completion positions meaningful.
 
@@ -263,7 +263,7 @@ class RLHFDataset(Dataset):
             return example
 
         normalized = dict(example)
-        normalized["prompt"] = _build_formal_math_prompt(formalization)
+        normalized["prompt"] = build_formal_math_prompt(formalization)
         normalized.setdefault("data_source", "formal_math")
         normalized.setdefault("reward_model", {"ground_truth": "", "style": "formal_math"})
 
