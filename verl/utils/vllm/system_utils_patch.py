@@ -26,6 +26,16 @@ ever reads ``find_loaded_library``.
 
 _PATCH_MARKER = "_verl_tilelang_stub_filter_applied"
 
+# Modules in vLLM that bind ``find_loaded_library`` at import time via
+# ``from vllm.utils.system_utils import find_loaded_library``. Patching only
+# ``system_utils`` is insufficient for these because they captured the function
+# object at their own import time; we have to rebind the attribute on each
+# already-imported caller too. This list must stay in sync with vLLM's tree.
+_FIND_LOADED_LIBRARY_CALLERS = (
+    "vllm.distributed.device_communicators.cuda_wrapper",
+    "vllm.device_allocator.cumem",
+)
+
 
 def apply_find_loaded_library_patch() -> None:
     """Wrap ``vllm.utils.system_utils.find_loaded_library`` to skip stubs.
@@ -33,13 +43,27 @@ def apply_find_loaded_library_patch() -> None:
     Best-effort: silently no-ops when vLLM is not installed or already
     patched. Must run before any caller binds ``find_loaded_library`` from
     ``vllm.utils.system_utils``.
+
+    OPSD specific: the recipe co-locates the student and the (frozen) teacher
+    on the same Ray actor. Loading the teacher's Qwen3.5 model triggers
+    ``fla`` -> ``tilelang`` between the actor's vLLM rollout init and the
+    rollout's first ``CudaRTLibrary()`` call, so the stub winds up in
+    ``/proc/self/maps`` even though we patched ``system_utils.find_loaded_library``
+    earlier. We additionally rebind the attribute in any caller module that
+    snapshotted the function at its own import time.
     """
+    import sys
+
     try:
         import vllm.utils.system_utils as system_utils
     except ImportError:
         return
 
     if getattr(system_utils, _PATCH_MARKER, False):
+        # Even when the marker is set we still rebind in caller modules below;
+        # they may have been imported after the first patch invocation.
+        patched_fn = system_utils.find_loaded_library
+        _rebind_in_callers(sys, patched_fn)
         return
 
     original_find_loaded_library = system_utils.find_loaded_library
@@ -69,3 +93,20 @@ def apply_find_loaded_library_patch() -> None:
 
     system_utils.find_loaded_library = find_loaded_library
     setattr(system_utils, _PATCH_MARKER, True)
+    _rebind_in_callers(sys, find_loaded_library)
+
+
+def _rebind_in_callers(sys_module, patched_fn) -> None:
+    """Rebind ``find_loaded_library`` in any vLLM module that already imported
+    the original via ``from vllm.utils.system_utils import find_loaded_library``.
+
+    Ignores modules we have not yet imported -- they will pick up the patched
+    function the first time they execute their own import statement.
+    """
+    for mod_name in _FIND_LOADED_LIBRARY_CALLERS:
+        mod = sys_module.modules.get(mod_name)
+        if mod is None:
+            continue
+        if getattr(mod, "find_loaded_library", None) is patched_fn:
+            continue
+        setattr(mod, "find_loaded_library", patched_fn)

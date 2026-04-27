@@ -1,0 +1,138 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# OPSD (On-Policy Self-Distillation) recipe for Lean-4 formal math.
+# Inherits the PPO defaults from `ppo_trainer.yaml` and overlays the
+# OPSD-specific knobs:
+#   * algorithm.opsd: JSD hyperparameters (beta, temperature, token_clip,
+#     top_k, forward_temperature) consumed by recipe/opsd/dp_actor.py.
+#   * data.max_teacher_prompt_length: cap on tokenized teacher prompt
+#     before concatenation with the student-generated response.
+#   * actor / ref fsdp_config.model_dtype: bf16 mixed precision for H20.
+# The teacher is the colocated reference module on the same Ray actor as the
+# student. We never call any "update_ref" path, so the teacher is fixed.
+#
+# Token budgets (must satisfy the dynamic-batch packer):
+#   max_student_seq = max_prompt_length + max_response_length     (rollout)
+#   max_teacher_seq = max_teacher_prompt_length + max_response_length
+#   ppo_max_token_len_per_gpu >= max_teacher_seq  (assertion in
+#     verl.utils.seqlen_balancing.rearrange_micro_batches; OPSD packs
+#     micro-batches by max(student_len, teacher_len) so the budget must
+#     fit a single max-length teacher example).
+# Memory at peak (bf16, vocab=248K on Qwen3.5):
+#   logits per fwd ≈ ppo_max_token_len_per_gpu * vocab * 2 bytes
+#   total fwd cost ≈ 2 * logits  (student + teacher, both materialised)
+# At ppo_max_token_len_per_gpu=12288 this is ~12 GB / GPU for the two
+# forwards, leaving ~50 GB headroom on H20 for FSDP weights, optimizer,
+# vLLM weights/KV, and FA3 activations. Drop max_response_length below
+# 4096 for tighter setups; raise vLLM gpu_memory_utilization once you've
+# verified the actor fits.
+
+max_model_len: 6144  # max student seq = max_prompt_length + max_response_length
+
+actor_rollout_ref:
+  hybrid_engine: True
+  actor:
+    fsdp_config:
+      model_dtype: bfloat16
+    ppo_mini_batch_size: 16
+    use_dynamic_bsz: True
+    # Must accommodate the longest combined teacher sequence
+    # (max_teacher_prompt_length + max_response_length). The student-only
+    # rollout max_model_len above is intentionally much smaller because
+    # vLLM never sees the teacher prefix.
+    ppo_max_token_len_per_gpu: 12288
+    optim:
+      lr: 1e-5
+  model:
+    trust_remote_code: True
+  ref:
+    fsdp_config:
+      model_dtype: bfloat16
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    gpu_memory_utilization: 0.45
+    log_prob_micro_batch_size_per_gpu: 1
+    max_num_batched_tokens: ${max_model_len}
+    max_model_len: ${max_model_len}
+    n: 8
+    val_kwargs:
+      top_p: 0.95
+      temperature: 0.6
+      n: 4
+      do_sample: True
+
+# OPSD never trains a critic; we keep the block so the schema validates and
+# disable it explicitly via `enable: False`.
+critic:
+  enable: False
+  model:
+    fsdp_config:
+      model_dtype: bfloat16
+
+algorithm:
+  # adv_estimator is unused (no advantages are computed) but the schema
+  # requires a value. ``grpo`` is the cheapest option that does not pull in
+  # GAE machinery.
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+  opsd:
+    # JSD mixture coefficient. 0.0 -> forward KL(teacher || student).
+    beta: 0.0
+    # Softmax temperature inside the JSD log-softmax. Matches TRL default.
+    temperature: 1.0
+    # Per-token JSD ceiling. Set to 0.05 for Qwen3.5-4B and 0.06 for 9B by the
+    # launcher script (see FBI/rl/OPSD/scripts/run_opsd_*.sh).
+    token_clip: null
+    # Top-k restriction over teacher distribution. Disabled by default in v1.
+    top_k: null
+    # Optional pre-softmax temperature applied to the raw forward-pass logits.
+    # Leave at 1.0 to match the TRL trainer (which only applies temperature
+    # inside the loss).
+    forward_temperature: 1.0
+
+data:
+  # Student must NOT think: thinking-mode tokens consume the response budget
+  # without producing Lean-4 syntax the verifier can score.
+  apply_chat_template_kwargs: {"enable_thinking": false}
+  filter_overlong_prompts: True
+  max_prompt_length: 2048
+  # Lean-4 proofs typically converge in <2k tokens; the legacy TRL OPSD
+  # trainer used max_completion_length=1024. We keep a 4k cap as a
+  # compromise between coverage and the full-vocab JSD logits memory cost
+  # (each extra response token costs ~500 KB on Qwen3.5's 248K vocab in
+  # bf16, doubled for the teacher forward).
+  max_response_length: 4096
+  shuffle: True
+  train_batch_size: 64
+  trust_remote_code: True
+  # Teacher prompt = NL proof sketch + Lean 4 statement. Capped here so the
+  # teacher forward pass does not silently blow past
+  # ppo_max_token_len_per_gpu (max_teacher_prompt_length + max_response_length
+  # must fit). NL solutions can hit 30k+ tokens in raw form; truncation
+  # happens at this boundary inside opsd_trainer._build_teacher_tensors.
+  max_teacher_prompt_length: 8192
+
+reward_model:
+  enable: False
+  use_reward_loop: False
+
+trainer:
+  project_name: FBI-${oc.env:USER,zeyu-zheng}
+  group_name: ${oc.env:EXPERIMENT,formal_opsd}
+  experiment_name: ${oc.env:EXPERIMENT,formal_opsd}
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 0
+  test_freq: 200
+  max_actor_ckpt_to_keep: 1
+  total_epochs: 1
+  val_before_train: False
+  balance_batch: True

@@ -36,6 +36,14 @@ from verl.utils.import_utils import load_extern_object
 logger = logging.getLogger(__name__)
 
 
+_LEAN4_INSTRUCTION = (
+    "First provide a detailed proof plan outlining the main proof steps and strategies.\n"
+    "The plan should highlight key ideas, intermediate lemmas, and proof structures "
+    "that will guide the construction of the final formal proof.\n"
+    "Then provide the completed Lean 4 file in a ```lean4``` code block."
+)
+
+
 def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
     """Build the user message for a Lean 4 proof-completion task.
 
@@ -47,10 +55,40 @@ def _build_formal_math_prompt(formalization: str) -> list[dict[str, str]]:
     user_prompt = (
         "Complete the following Lean 4 code:\n\n"
         f"```lean4\n{formalization}```\n\n"
-        "First provide a detailed proof plan outlining the main proof steps and strategies.\n"
-        "The plan should highlight key ideas, intermediate lemmas, and proof structures "
-        "that will guide the construction of the final formal proof.\n"
-        "Then provide the completed Lean 4 file in a ```lean4``` code block."
+        f"{_LEAN4_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": user_prompt}]
+
+
+def _build_formal_math_teacher_prompt(formalization: str, solution: str) -> list[dict[str, str]]:
+    """Build the OPSD teacher's user message for a Lean 4 proof-completion task.
+
+    The teacher receives a privileged natural-language proof sketch prepended
+    to the same Lean 4 statement the student sees, between
+    ``=== Reference Reasoning Begin/End ===`` markers. The instruction tail is
+    byte-identical to ``_build_formal_math_prompt`` so the teacher's
+    completion-side tokens are tokenized under the same template suffix as the
+    student's — this is what makes the JSD on completion positions meaningful.
+
+    The teacher is meant to be tokenized with the chat template's "thinking"
+    mode enabled (``enable_thinking=True``) so it can use long-form
+    deliberation against the NL sketch before emitting Lean 4. The student is
+    tokenized with thinking disabled. That asymmetry is the only behavioural
+    difference between the two prompts.
+
+    Mirrors the legacy TRL trainer's
+    ``SelfDistillationDataCollator.__call__`` template (default branch, not
+    ``reason_first``). Keep this in sync byte-for-byte with that template
+    until the legacy collator is deleted in Phase 5.
+    """
+    user_prompt = (
+        "Here is a natural-language proof sketch for the theorem below:\n"
+        "=== Reference Reasoning Begin ===\n"
+        f"{solution}\n"
+        "=== Reference Reasoning End ===\n\n"
+        "Complete the following Lean 4 code:\n\n"
+        f"```lean4\n{formalization}```\n\n"
+        f"{_LEAN4_INSTRUCTION}"
     )
     return [{"role": "user", "content": user_prompt}]
 
@@ -206,6 +244,17 @@ class RLHFDataset(Dataset):
         carry a ``prompt`` plus a ``data_source`` / ``reward_model`` triplet,
         so we build them on the fly. Rows that already carry a ``prompt``
         (or no ``formalization`` at all) are returned untouched.
+
+        For OPSD self-distillation we additionally synthesize a
+        ``teacher_raw_prompt`` (NL proof sketch + Lean 4 statement) when the
+        row has a non-null ``solution`` column. The student's ``prompt`` and
+        the teacher's ``teacher_raw_prompt`` differ only in that the teacher
+        is given the privileged NL sketch; everything downstream (chat
+        template suffix, special tokens) is byte-identical so the JSD on
+        completion positions is well defined. Rows without a ``solution`` get
+        no teacher prompt and the OPSD trainer falls back to a clone of the
+        student inputs (degenerate teacher, JSD == 0, useful for plumbing
+        smoke tests but not for actual distillation).
         """
         if example.get("prompt") is not None:
             return example
@@ -222,6 +271,21 @@ class RLHFDataset(Dataset):
         extra_info.setdefault("formal_statement", formalization)
         extra_info.setdefault("timeout", 300)
         normalized["extra_info"] = extra_info
+
+        # OPSD-only: build the teacher prompt iff the row has a usable NL
+        # proof sketch. We treat None, empty string, and pandas NaN-like
+        # strings as "missing" because parquet round-trips can mangle them.
+        # The key is always present (as None when missing) so the collate
+        # function keeps non-tensor batch alignment with the rest of the
+        # batch — otherwise mixed solution/no-solution batches would produce
+        # a misaligned ``teacher_raw_prompt`` array and crash downstream.
+        solution = normalized.get("solution")
+        if solution is not None and isinstance(solution, str) and solution.strip():
+            normalized["teacher_raw_prompt"] = _build_formal_math_teacher_prompt(
+                formalization, solution
+            )
+        else:
+            normalized["teacher_raw_prompt"] = None
         return normalized
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):

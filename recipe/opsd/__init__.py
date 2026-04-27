@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,15 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Reward functions for formal-math (Lean 4) RL.
-
-Self-contained: shells out to ``lake exe repl`` directly, no external
-prover repo required. Toolchain discovery honours ``FORMAL_LAKE_PATH`` /
-``FORMAL_LEAN_WORKSPACE``; see :mod:`.formal_math` for defaults.
-"""
-
-from verl.utils.reward_score.feedback import formal_math  # noqa: F401
-from verl.utils.reward_score.feedback.formal_math import compute_score  # noqa: F401
-
-__all__ = ["compute_score", "formal_math"]
+"""On-Policy Self-Distillation recipe."""
