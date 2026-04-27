@@ -295,10 +295,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModel,
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
 
-        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import (
+            AutoModelForVision2Seq,
+            get_generation_config,
+            print_model_size,
+            update_model_config,
+        )
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]

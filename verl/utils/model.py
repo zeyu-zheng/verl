@@ -33,13 +33,20 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# transformers >= 5.0 dropped AutoModelForVision2Seq in favour of
+# AutoModelForImageTextToText. Re-exported here so downstream verl modules
+# can keep using the old name without each one repeating the shim.
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = AutoModelForImageTextToText
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
@@ -619,7 +626,7 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -651,6 +658,13 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         attn_implementation="flash_attention_2",
         trust_remote_code=trust_remote_code,
     )
+    # VLM configs (Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL ...) keep `hidden_size`
+    # only on `config.text_config`, so TRL's ValueHead crashes with an
+    # UnboundLocalError. Surface it at the top level when missing.
+    if getattr(ori_model.config, "hidden_size", None) is None:
+        text_config = getattr(model_config, "text_config", None)
+        if text_config is not None and getattr(text_config, "hidden_size", None) is not None:
+            ori_model.config.hidden_size = text_config.hidden_size
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)
     return model
