@@ -1,3 +1,4 @@
 [submodule "recipe"]
 	path = recipe
-	url = https://github.com/verl-project/verl-recipe.git
+	url = https://github.com/zeyu-zheng/verl-recipe.git
+	branch = qwen35-formal-math-v0.7.1
